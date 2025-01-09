@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 from dataset import get_dataset
-from MRL.layer import EmotionClassifier
+from MRL.engine import EmotionClassifier
 
 def test(model: nn.Module):
     _, _, testloader = get_dataset()
@@ -17,6 +17,11 @@ def test(model: nn.Module):
             targets = data["labels"].to("cuda")
 
             outputs = model(input_ids, attention_mask)
+
+            # this was a "fix suggested by GPT to get test.py running... it runs but I'm not confident it is correct"
+            if isinstance(outputs, list):
+                outputs = torch.mean(torch.stack(outputs), dim=0)
+
             loss = criterion(outputs, targets)
             test_loss += loss.item()
 
@@ -24,7 +29,7 @@ def test(model: nn.Module):
 
 if __name__ == "__main__":
     model = EmotionClassifier(model_name="bert-base-uncased", num_classes=6, apply_mrl=True)
-    model.load_state_dict(torch.load("model.pth"))
+    model.load_state_dict(torch.load("/pub0/bchharaw/ALL_MRL/matryoshka-representation-learning/src/model.pth"))
     model.to("cuda")
 
     test_loss = test(model)
