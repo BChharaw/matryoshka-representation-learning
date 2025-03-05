@@ -4,6 +4,7 @@ from typing import List
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from transformers import AutoModel, AdamW, get_linear_schedule_with_warmup
+import torch.nn.functional as F
 
 class Architecture:
     def __init__(
@@ -21,7 +22,7 @@ class Architecture:
     ):
         self.model_name = model_name
         self.num_classes = num_classes
-        self.m_scales = m_scales
+        self.m_scales = sorted(m_scales)  # just making sure that scales is passed in the correct order
         self.apply_mrl = apply_mrl
         self.trainloader = trainloader
         self.valloader = valloader
@@ -30,35 +31,52 @@ class Architecture:
         self.num_epochs = num_epochs
         self.device = device
 
+        # Load BERT
         self.bert_model = AutoModel.from_pretrained(model_name).to(device)
+        
         if apply_mrl:
-            self.classifiers = nn.ModuleList([nn.Linear(d, num_classes) for d in m_scales])
+            max_scale = max(self.m_scales)
+            self.mrl_projection = nn.Linear(768, max_scale).to(device)
+            self.shared_classifier = nn.Linear(max_scale, num_classes).to(device)
         else:
-            self.classifiers = nn.ModuleList([nn.Linear(768, num_classes)])
-        self.classifiers.to(device)
-
-        params = list(self.bert_model.parameters()) + list(self.classifiers.parameters())
+            self.shared_classifier = nn.Linear(768, num_classes).to(device)
+        
+        if apply_mrl:
+            params = list(self.bert_model.parameters()) + list(self.mrl_projection.parameters()) + list(self.shared_classifier.parameters())
+        else:
+            params = list(self.bert_model.parameters()) + list(self.shared_classifier.parameters())
         self.optimizer = AdamW(params, lr=lr)
         steps = len(trainloader) * num_epochs
         self.scheduler = get_linear_schedule_with_warmup(self.optimizer, 0, steps)
         self.ce_loss = nn.CrossEntropyLoss()
 
+        # collecting data for tracking
         self.epoch_list = []
         self.train_loss_history = []
         self.val_loss_history = []
-        self.scale_loss_history = [[] for _ in m_scales]
+        self.scale_loss_history = [[] for _ in self.m_scales]
         self.train_acc_history = []
         self.val_acc_history = []
-        self.scale_train_acc_history = [[] for _ in m_scales]
-        self.scale_val_acc_history = [[] for _ in m_scales]
+        self.scale_train_acc_history = [[] for _ in self.m_scales]
+        self.scale_val_acc_history = [[] for _ in self.m_scales]
         self.best_val_loss = float("inf")
 
     def forward(self, input_ids: Tensor, attention_mask: Tensor):
         out = self.bert_model(input_ids=input_ids, attention_mask=attention_mask)
         cls_out = out.last_hidden_state[:, 0, :]
+        
         if self.apply_mrl:
-            return [self.classifiers[i](cls_out[:, :d]) for i, d in enumerate(self.m_scales)]
-        return self.classifiers[0](cls_out)
+            proj_out = self.mrl_projection(cls_out)  # shape: [batch, max_scale]
+            outputs = []
+            # For each scale d, use the first d dimensions of both representation and classifier weight.
+            for d in self.m_scales:
+                nested_rep = proj_out[:, :d]
+                nested_weight = self.shared_classifier.weight[:, :d]
+                logits = F.linear(nested_rep, nested_weight, self.shared_classifier.bias)
+                outputs.append(logits)
+            return outputs
+        else:
+            return self.shared_classifier(cls_out)
 
     def compute_loss(self, preds, labels: Tensor):
         if isinstance(preds, torch.Tensor):
@@ -83,13 +101,17 @@ class Architecture:
 
     def train_one_epoch(self, epoch_idx):
         self.bert_model.train()
-        self.classifiers.train()
+        if self.apply_mrl:
+            self.mrl_projection.train()
+        self.shared_classifier.train()
         total_loss, n_batches = 0.0, 0
         scale_loss_sum = [0.0] * len(self.m_scales)
         scale_acc_sum = [0.0] * len(self.m_scales)
 
         for batch in tqdm(self.trainloader, desc=f"Train Epoch {epoch_idx}"):
-            inp, mask, labels = batch["input_ids"].to(self.device), batch["attention_mask"].to(self.device), batch["labels"].to(self.device)
+            inp = batch["input_ids"].to(self.device)
+            mask = batch["attention_mask"].to(self.device)
+            labels = batch["labels"].to(self.device)
             self.optimizer.zero_grad()
             outputs = self.forward(inp, mask)
             loss = self.compute_loss(outputs, labels)
@@ -97,8 +119,10 @@ class Architecture:
 
             sw_losses = self.compute_scale_wise_loss(outputs, labels)
             sw_accs = self.compute_scale_wise_accuracy(outputs, labels)
-            for i, val in enumerate(sw_losses): scale_loss_sum[i] += val
-            for i, val in enumerate(sw_accs):   scale_acc_sum[i]  += val
+            for i, val in enumerate(sw_losses):
+                scale_loss_sum[i] += val
+            for i, val in enumerate(sw_accs):
+                scale_acc_sum[i] += val
 
             loss.backward()
             self.optimizer.step()
@@ -113,22 +137,28 @@ class Architecture:
 
     def validate_one_epoch(self, epoch_idx):
         self.bert_model.eval()
-        self.classifiers.eval()
+        if self.apply_mrl:
+            self.mrl_projection.eval()
+        self.shared_classifier.eval()
         total_loss, n_batches = 0.0, 0
         scale_loss_sum = [0.0] * len(self.m_scales)
         scale_acc_sum = [0.0] * len(self.m_scales)
 
         with torch.no_grad():
             for batch in tqdm(self.valloader, desc=f"Val Epoch {epoch_idx}"):
-                inp, mask, labels = batch["input_ids"].to(self.device), batch["attention_mask"].to(self.device), batch["labels"].to(self.device)
+                inp = batch["input_ids"].to(self.device)
+                mask = batch["attention_mask"].to(self.device)
+                labels = batch["labels"].to(self.device)
                 outputs = self.forward(inp, mask)
                 loss = self.compute_loss(outputs, labels)
                 total_loss += loss.item()
 
                 sw_losses = self.compute_scale_wise_loss(outputs, labels)
                 sw_accs = self.compute_scale_wise_accuracy(outputs, labels)
-                for i, val in enumerate(sw_losses): scale_loss_sum[i] += val
-                for i, val in enumerate(sw_accs):   scale_acc_sum[i]  += val
+                for i, val in enumerate(sw_losses):
+                    scale_loss_sum[i] += val
+                for i, val in enumerate(sw_accs):
+                    scale_acc_sum[i] += val
                 n_batches += 1
 
         avg_loss = total_loss / n_batches
@@ -145,17 +175,26 @@ class Architecture:
             self.epoch_list.append(e)
             self.train_loss_history.append(train_loss)
             self.val_loss_history.append(val_loss)
-            for i, sl in enumerate(train_sw_loss): self.scale_loss_history[i].append(sl)
+            for i, sl in enumerate(train_sw_loss):
+                self.scale_loss_history[i].append(sl)
             self.train_acc_history.append(train_overall_acc)
             self.val_acc_history.append(val_overall_acc)
-            for i, acc_val in enumerate(train_sw_acc): self.scale_train_acc_history[i].append(acc_val)
-            for i, acc_val in enumerate(val_sw_acc):   self.scale_val_acc_history[i].append(acc_val)
+            for i, acc_val in enumerate(train_sw_acc):
+                self.scale_train_acc_history[i].append(acc_val)
+            for i, acc_val in enumerate(val_sw_acc):
+                self.scale_val_acc_history[i].append(acc_val)
 
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
-                torch.save({'bert_model': self.bert_model.state_dict(),
-                            'classifiers': self.classifiers.state_dict()},
-                           "emotion_classifier_model.pth")
+                state_dict = {}
+                for k, v in self.bert_model.state_dict().items():
+                    state_dict["bert." + k] = v
+                if self.apply_mrl:
+                    for k, v in self.mrl_projection.state_dict().items():
+                        state_dict["mrl_projection." + k] = v
+                for k, v in self.shared_classifier.state_dict().items():
+                    state_dict["shared_classifier." + k] = v
+                torch.save(state_dict, "emotion_classifier_model.pth")
 
             print(f"\nEpoch {e} Summary:")
             print(f" Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")

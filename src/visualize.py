@@ -10,9 +10,9 @@ from sklearn.metrics import (
     classification_report,
     accuracy_score
 )
-
 from data_loader import Data_Loader
 from transformers import AutoModel
+import torch.nn.functional as F  # Needed for F.linear
 
 class Evaluator:
     def __init__(
@@ -38,9 +38,11 @@ class Evaluator:
         _, _, self.testloader = loader.get_dataset()
         self.tokenizer = loader.tokenizer
 
-        # Build model with MRL classifiers
+        # Build the model to match the revised MRL architecture:
+        # BERT + shared mrl_projection + shared_classifier.
         self._build_model()
-        self.model.load_state_dict(torch.load(model_path, map_location=device))
+        state_dict = torch.load(model_path, map_location=device)
+        self.model.load_state_dict(state_dict)
         self.model.to(device)
 
         # We'll store predictions/probs for each scale
@@ -49,17 +51,30 @@ class Evaluator:
         self.targets = []
 
     def _build_model(self):
-        # Build a small container model that parallels your Architecture logic
+        # Build a container model that reflects the revised training architecture.
         self.bert = AutoModel.from_pretrained(self.model_name)
-        self.classifiers = nn.ModuleList([nn.Linear(d, self.num_classes) for d in self.scales])
+        max_scale = max(self.scales)
+        self.mrl_projection = nn.Linear(768, max_scale)
+        self.shared_classifier = nn.Linear(max_scale, self.num_classes)
         self.model = nn.Module()
         self.model.bert = self.bert
-        self.model.classifiers = self.classifiers
+        self.model.mrl_projection = self.mrl_projection
+        self.model.shared_classifier = self.shared_classifier
 
     def _forward(self, input_ids, attention_mask):
         out = self.model.bert(input_ids=input_ids, attention_mask=attention_mask)
         cls_out = out.last_hidden_state[:, 0, :]
-        return [self.model.classifiers[i](cls_out[:, :d]) for i, d in enumerate(self.scales)]
+        # Project to a vector of size [batch, max_scale]
+        proj_out = self.model.mrl_projection(cls_out)
+        outputs = []
+        # For each scale d, use the first d dimensions from both the projection
+        # and the classifier's weight matrix to enforce a nested structure.
+        for d in self.scales:
+            nested_rep = proj_out[:, :d]
+            nested_weight = self.model.shared_classifier.weight[:, :d]
+            logits = F.linear(nested_rep, nested_weight, self.model.shared_classifier.bias)
+            outputs.append(logits)
+        return outputs
 
     def evaluate(self):
         self.model.eval()
@@ -121,7 +136,6 @@ class Evaluator:
         collected = 0
         for batch in self.testloader:
             if "text" not in batch:
-                # If the dataset doesn't retain raw text, skip or handle differently
                 break
             for i in range(len(batch["text"])):
                 if collected >= self.max_samples:
